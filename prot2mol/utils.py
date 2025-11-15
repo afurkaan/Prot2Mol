@@ -17,6 +17,9 @@ from multiprocessing import Pool
 import torch
 import numpy as np
 import wandb
+import logging
+
+logger = logging.getLogger(__name__)
 
 def get_mol(smiles_or_mol):
     '''
@@ -189,73 +192,221 @@ def logp_calculation(mols):
 
 def metrics_calculation(predictions, references, train_data, train_vec=None,training=True):
     
+    # `predictions` are decoded SELFIES from the model.
+    # `references` are now expected to be ground-truth SMILES.
     predictions = [x.replace(" ", "") for x in predictions]
-    references = [x.replace(" ", "") for x in references]
 
     prediction_smiles = pd.DataFrame([sf.decoder(x) for x in predictions], columns=["smiles"])
     
-    prediction_validity_ratio = fraction_valid(list(prediction_smiles["smiles"]))
+    # Initialize all metrics to 0
+    metrics = {"validity": 0,
+               "uniqueness": 0,
+               "novelty_against_training_samples": 0,
+               "novelty_against_reference_samples": 0,
+               "intdiv": 0,
+               "similarity_to_training_samples": 0,
+               "similarity_to_reference_samples": 0,
+               "sa_score": 0,
+               "qed_score": 0,
+               "logp_score": 0}
+    
+    # Try validity calculation
+    try:
+        prediction_validity_ratio = fraction_valid(list(prediction_smiles["smiles"]))
+        metrics["validity"] = prediction_validity_ratio
+    except (ZeroDivisionError, ValueError) as e:
+        logging.warning(f"Zero division at validity calculation: {e}")
+        metrics["validity"] = 0
+        prediction_validity_ratio = 0
     
     if prediction_validity_ratio != 0:
         
         prediction_mols = to_mol(list(prediction_smiles["smiles"]))
     
-        training_data_smiles = [sf.decoder(x) for x in train_data["Compound_SELFIES"]]
-        reference_smiles = [sf.decoder(x) for x in references] 
-        
-        prediction_uniqueness_ratio = fraction_unique(prediction_smiles["smiles"])
-        
-        prediction_smiles_novelty_against_training_samples = novelty(list(prediction_smiles["smiles"]), training_data_smiles)
-        prediction_smiles_novelty_against_reference_samples = novelty(list(prediction_smiles["smiles"]), reference_smiles)
-        
-        prediction_vecs = generate_vecs(prediction_mols)
-        reference_vec = generate_vecs([Chem.MolFromSmiles(x) for x in reference_smiles if Chem.MolFromSmiles(x) is not None])
-        
-        predicted_vs_reference_sim_mean, predicted_vs_reference_sim_list, _ = average_agg_tanimoto(reference_vec,prediction_vecs, no_list=False)
-        if train_vec is not None:
-            predicted_vs_training_sim_mean, predicted_vs_training_sim_list, _ = average_agg_tanimoto(train_vec,prediction_vecs, no_list=False)
+        # Handle both DataFrame and list inputs for train_data
+        if isinstance(train_data, list):
+            # If train_data is already a list of SMILES
+            training_data_smiles = train_data
+        elif hasattr(train_data, 'columns'):
+            # If train_data is a pandas DataFrame
+            if "Compound_SMILES" in train_data.columns:
+                training_data_smiles = train_data["Compound_SMILES"].tolist()
+            else:
+                training_data_smiles = [sf.decoder(x) for x in train_data["Compound_SELFIES"]]
+        elif hasattr(train_data, 'column_names'):
+            # If train_data is a HuggingFace Dataset
+            if "Compound_SMILES" in train_data.column_names:
+                training_data_smiles = train_data["Compound_SMILES"]
+            else:
+                training_data_smiles = [sf.decoder(x) for x in train_data["Compound_SELFIES"]]
         else:
-            predicted_vs_training_sim_mean, predicted_vs_training_sim_list = 0, []
+            logging.warning(f"Unexpected train_data type: {type(train_data)}, using empty list")
+            training_data_smiles = []
         
-        IntDiv = 1 - average_agg_tanimoto(prediction_vecs, prediction_vecs, agg="mean", no_list=True)
+        # `references` is now a list of SMILES, so we use it directly.
+        reference_smiles = references
         
-        prediction_sa_score_list = sascorer_calculation(prediction_mols)
-        prediction_sa_score = np.mean(prediction_sa_score_list)
+        # Try uniqueness calculation
+        try:
+            prediction_uniqueness_ratio = fraction_unique(prediction_smiles["smiles"])
+            metrics["uniqueness"] = prediction_uniqueness_ratio
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at uniqueness calculation: {e}")
+            metrics["uniqueness"] = 0
         
-        prediction_qed_score_list = qed_calculation(prediction_mols)
-        prediction_qed_score = np.mean(prediction_qed_score_list)
+        # Try novelty calculations
+        try:
+            prediction_smiles_novelty_against_training_samples = novelty(list(prediction_smiles["smiles"]), training_data_smiles)
+            metrics["novelty_against_training_samples"] = prediction_smiles_novelty_against_training_samples
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at novelty_against_training_samples calculation: {e}")
+            metrics["novelty_against_training_samples"] = 0
+            
+        try:
+            prediction_smiles_novelty_against_reference_samples = novelty(list(prediction_smiles["smiles"]), reference_smiles)
+            metrics["novelty_against_reference_samples"] = prediction_smiles_novelty_against_reference_samples
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at novelty_against_reference_samples calculation: {e}")
+            metrics["novelty_against_reference_samples"] = 0
         
-        prediction_logp_score_list = logp_calculation(prediction_mols)
-        prediction_logp_score = np.mean(prediction_logp_score_list)
+        # Try similarity calculations
+        try:
+            prediction_vecs = generate_vecs(prediction_mols)
+            reference_vec = generate_vecs([Chem.MolFromSmiles(x) for x in reference_smiles if Chem.MolFromSmiles(x) is not None])
+            
+            predicted_vs_reference_sim_mean, predicted_vs_reference_sim_list, _ = average_agg_tanimoto(reference_vec,prediction_vecs, no_list=False)
+            metrics["similarity_to_reference_samples"] = predicted_vs_reference_sim_mean
+        except (ZeroDivisionError, ValueError, RuntimeError) as e:
+            logging.warning(f"Zero division at similarity_to_reference_samples calculation: {e}")
+            metrics["similarity_to_reference_samples"] = 0
+            predicted_vs_reference_sim_list = []
+            
+        try:
+            if train_vec is not None:
+                predicted_vs_training_sim_mean, predicted_vs_training_sim_list, _ = average_agg_tanimoto(train_vec,prediction_vecs, no_list=False)
+                metrics["similarity_to_training_samples"] = predicted_vs_training_sim_mean
+            else:
+                predicted_vs_training_sim_mean, predicted_vs_training_sim_list = 0, []
+                metrics["similarity_to_training_samples"] = 0
+        except (ZeroDivisionError, ValueError, RuntimeError) as e:
+            logging.warning(f"Zero division at similarity_to_training_samples calculation: {e}")
+            metrics["similarity_to_training_samples"] = 0
+            predicted_vs_training_sim_list = []
         
-        metrics = {"validity": prediction_validity_ratio,
-                   "uniqueness": prediction_uniqueness_ratio,
-                   "novelty_against_training_samples": prediction_smiles_novelty_against_training_samples,
-                   "novelty_against_reference_samples": prediction_smiles_novelty_against_reference_samples,
-                   "intdiv": IntDiv,
-                   "similarity_to_training_samples": predicted_vs_training_sim_mean,
-                   "similarity_to_reference_samples": predicted_vs_reference_sim_mean,
-                   "sa_score": prediction_sa_score,
-                   "qed_score": prediction_qed_score,
-                   "logp_score": prediction_logp_score}
+        # Try internal diversity calculation
+        try:
+            IntDiv = 1 - average_agg_tanimoto(prediction_vecs, prediction_vecs, agg="mean", no_list=True)
+            metrics["intdiv"] = IntDiv
+        except (ZeroDivisionError, ValueError, RuntimeError) as e:
+            logging.warning(f"Zero division at intdiv calculation: {e}")
+            metrics["intdiv"] = 0
+        
+        # Try SA score calculation
+        try:
+            prediction_sa_score_list = sascorer_calculation(prediction_mols)
+            # Filter out None values before calculating mean
+            valid_sa_scores = [score for score in prediction_sa_score_list if score is not None]
+            if valid_sa_scores:
+                prediction_sa_score = np.mean(valid_sa_scores)
+            else:
+                prediction_sa_score = 0
+            metrics["sa_score"] = prediction_sa_score
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at sa_score calculation: {e}")
+            metrics["sa_score"] = 0
+            prediction_sa_score_list = []
+        
+        # Try QED score calculation
+        try:
+            prediction_qed_score_list = qed_calculation(prediction_mols)
+            # Filter out None values before calculating mean
+            valid_qed_scores = [score for score in prediction_qed_score_list if score is not None]
+            if valid_qed_scores:
+                prediction_qed_score = np.mean(valid_qed_scores)
+            else:
+                prediction_qed_score = 0
+            metrics["qed_score"] = prediction_qed_score
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at qed_score calculation: {e}")
+            metrics["qed_score"] = 0
+            prediction_qed_score_list = []
+        
+        # Try LogP score calculation
+        try:
+            prediction_logp_score_list = logp_calculation(prediction_mols)
+            # Filter out None values before calculating mean
+            valid_logp_scores = [score for score in prediction_logp_score_list if score is not None]
+            if valid_logp_scores:
+                prediction_logp_score = np.mean(valid_logp_scores)
+            else:
+                prediction_logp_score = 0
+            metrics["logp_score"] = prediction_logp_score
+        except (ZeroDivisionError, ValueError) as e:
+            logging.warning(f"Zero division at logp_score calculation: {e}")
+            metrics["logp_score"] = 0
+            prediction_logp_score_list = []
     
-    else:
-        metrics = {"validity": 0,
-                   "uniqueness": 0,
-                   "novelty_against_training_samples": 0,
-                   "novelty_against_reference_samples": 0,
-                   "intdiv": 0,
-                   "similarity_to_training_samples": 0,
-                   "similarity_to_reference_samples": 0,
-                   "sa_score": 0,
-                   "qed_score": 0,
-                   "logp_score": 0}
     if training: 
-        wandb.log(metrics) 
+        # Only log to wandb if it has been initialized
+        try:
+            if wandb.run is not None:
+                wandb.log(metrics)
+        except Exception as e:
+            logging.warning(f"Failed to log metrics to wandb: {e}")
     if training:
         return metrics
     elif training == False:
+        # Get the number of predictions to ensure all arrays have the same length
+        num_predictions = len(prediction_smiles["smiles"])
         
+        # Ensure all lists exist and have the correct length
+        if 'predicted_vs_reference_sim_list' not in locals():
+            predicted_vs_reference_sim_list = [None] * num_predictions
+        elif len(predicted_vs_reference_sim_list) != num_predictions:
+            predicted_vs_reference_sim_list = (predicted_vs_reference_sim_list + [None] * num_predictions)[:num_predictions]
+            
+        if 'predicted_vs_training_sim_list' not in locals():
+            predicted_vs_training_sim_list = [None] * num_predictions
+        elif len(predicted_vs_training_sim_list) != num_predictions:
+            predicted_vs_training_sim_list = (predicted_vs_training_sim_list + [None] * num_predictions)[:num_predictions]
+            
+        if 'prediction_sa_score_list' not in locals():
+            prediction_sa_score_list = [None] * num_predictions
+        elif len(prediction_sa_score_list) != num_predictions:
+            prediction_sa_score_list = (prediction_sa_score_list + [None] * num_predictions)[:num_predictions]
+            
+        if 'prediction_qed_score_list' not in locals():
+            prediction_qed_score_list = [None] * num_predictions
+        elif len(prediction_qed_score_list) != num_predictions:
+            prediction_qed_score_list = (prediction_qed_score_list + [None] * num_predictions)[:num_predictions]
+            
+        if 'prediction_logp_score_list' not in locals():
+            prediction_logp_score_list = [None] * num_predictions
+        elif len(prediction_logp_score_list) != num_predictions:
+            prediction_logp_score_list = (prediction_logp_score_list + [None] * num_predictions)[:num_predictions]
+            
+        # Verify all arrays have the same length before creating DataFrame
+        arrays_info = {
+            "smiles": len(prediction_smiles["smiles"]),
+            "test_sim": len(predicted_vs_reference_sim_list),
+            "train_sim": len(predicted_vs_training_sim_list),
+            "sa_score": len(prediction_sa_score_list),
+            "qed_score": len(prediction_qed_score_list),
+            "logp_score": len(prediction_logp_score_list)
+        }
+        
+        # Check if all arrays have the same length
+        lengths = list(arrays_info.values())
+        if len(set(lengths)) > 1:
+            logging.warning(f"Array length mismatch detected: {arrays_info}")
+            # Force all arrays to have the same length as smiles
+            target_length = len(prediction_smiles["smiles"])
+            predicted_vs_reference_sim_list = (predicted_vs_reference_sim_list + [None] * target_length)[:target_length]
+            predicted_vs_training_sim_list = (predicted_vs_training_sim_list + [None] * target_length)[:target_length]
+            prediction_sa_score_list = (prediction_sa_score_list + [None] * target_length)[:target_length]
+            prediction_qed_score_list = (prediction_qed_score_list + [None] * target_length)[:target_length]
+            prediction_logp_score_list = (prediction_logp_score_list + [None] * target_length)[:target_length]
+            
         result_dict = {"smiles": prediction_smiles["smiles"],
                        "test_sim": predicted_vs_reference_sim_list, 
                        "train_sim": predicted_vs_training_sim_list,
@@ -263,12 +414,12 @@ def metrics_calculation(predictions, references, train_data, train_vec=None,trai
                        "qed_score": prediction_qed_score_list,
                        "logp_score": prediction_logp_score_list
                        }
-        results = pd.DataFrame.from_dict(result_dict)
+        
+        try:
+            results = pd.DataFrame.from_dict(result_dict)
+        except ValueError as e:
+            logging.error(f"DataFrame creation failed: {e}")
+            # Fallback: return only SMILES
+            results = pd.DataFrame({"smiles": prediction_smiles["smiles"]})
         
         return metrics, results
-        
-
-
-        
-        
-        

@@ -19,7 +19,7 @@ def process_in_parallel(smiles_list, num_processes):
 class ChemblUniprotConverter:
     def __init__(self):
         self.url = "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/chembl_uniprot_mapping.txt"
-        self.save_path = "../data/chembl_uniprot_mapping.txt"
+        self.save_path = "./data/chembl_uniprot_mapping.txt"
         self.uniprot_to_chembl = self.load_mapping()
 
     def load_mapping(self):
@@ -40,8 +40,3 @@ class ChemblUniprotConverter:
             print(f"File downloaded and saved to {save_path}")
         else:
             print(f"Failed to download file. Status code: {response.status_code}")
-
-
-
-
-

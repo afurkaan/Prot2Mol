@@ -41,8 +41,10 @@ def download_and_decompress(url, output_dir):
 def prepare_papyrus(molecule_url, protein_url, output_directory, pchembl_threshold=None, prot_len=None, only_human=None, max_cores=10):
     
     converter = ChemblUniprotConverter()
-    molecule_file = download_and_decompress(molecule_url, output_directory)
-    protein_file = download_and_decompress(protein_url, output_directory)
+    #molecule_file = download_and_decompress(molecule_url, output_directory)
+    #protein_file = download_and_decompress(protein_url, output_directory)
+    molecule_file = "/home/hu/hu544211/Prot2Mol/data/papyrus/05.6++_combined_set_without_stereochemistry.tsv"
+    protein_file = "/home/hu/hu544211/Prot2Mol/data/papyrus/05.5_combined_set_protein_targets.tsv"
     
     mol_data = pd.read_csv(molecule_file, sep='\t')
     prot_data = pd.read_csv(protein_file, sep='\t')

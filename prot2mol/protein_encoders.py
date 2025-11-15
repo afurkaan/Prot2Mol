@@ -5,10 +5,7 @@ from transformers import (T5Tokenizer, T5EncoderModel,
 from typing import Optional, Tuple, Dict, Any
 import re
 import numpy as np
-
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
-
 def count_trainable_parameters(model):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])
@@ -16,9 +13,7 @@ def count_trainable_parameters(model):
 
 class ProteinEncoder:
     """Base class for protein encoders"""
-    def __init__(self, max_length: int = 1000, device: str = "cuda" if torch.cuda.is_available() else "cpu",
-                 active: bool = False):
-        self.device = device
+    def __init__(self, max_length: int = 1000, active: bool = False):
         self.model = None
         self.max_length = max_length
         
@@ -34,11 +29,15 @@ class ProteinEncoder:
 
 class ProtT5Encoder(ProteinEncoder):
     def __init__(self, model_name: str = "Rostlab/prot_t5_xl_uniref50", max_length: int = 1000,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
                  active: bool = True):
-        super().__init__(max_length, device, active)
+        super().__init__(max_length, active)
         print("active Value: ", active)
-        self.model = T5EncoderModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+        # Use local path if it contains our local models directory structure
+        if "Rostlab" in model_name and not model_name.startswith("/"):
+            model_path = _get_model_path("Rostlab--prot_t5_xl_uniref50")
+        else:
+            model_path = model_name
+        self.model = T5EncoderModel.from_pretrained(model_path)
         if active is True:
             print("ProtT5 Encoder is setting Training Mode")
             self.model.train()
@@ -67,8 +66,13 @@ class ESM2Encoder(ProteinEncoder):
     def __init__(self, model_name: str = "facebook/esm2_t33_650M_UR50D", max_length: int = 1000,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu",
                  active: bool = True):
-        super().__init__(max_length, device, active)
-        self.model = EsmModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+        super().__init__(max_length, active)
+        # Use local path if it contains our local models directory structure
+        if "facebook" in model_name and not model_name.startswith("/"):
+            model_path = _get_model_path("facebook--esm2_t33_650M_UR50D")
+        else:
+            model_path = model_name
+        self.model = EsmModel.from_pretrained(model_path)
 
 
         # Set model training mode and freeze parameters after initialization
@@ -101,12 +105,16 @@ class ESM2Encoder(ProteinEncoder):
         return outputs.last_hidden_state
 
 class SaProtEncoder(ProteinEncoder):
-    def __init__(self, model_name: str = "westlake-repl/SaProt_1.3B_AF2", max_length: int = 1000,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    def __init__(self, model_name: str = "westlake-repl/SaProt_650M_AF2", max_length: int = 1000,
                  active: bool = True):
-        super().__init__(max_length, device, active)
-
-        self.model = EsmModel.from_pretrained(model_name).to(device)
+        super().__init__(max_length, active)
+        # Use local path if it contains our local models directory structure
+        if "westlake-repl" in model_name and not model_name.startswith("/"):
+            model_path = _get_model_path("westlake-repl--SaProt_1.3B_AF2")
+        else:
+            model_path = model_name
+        self.model = EsmForMaskedLM.from_pretrained(model_path)
+        
         # Set model training mode and freeze parameters after initialization
 
         if active is False:
@@ -155,16 +163,32 @@ def get_protein_encoder(model_name: str, max_length: int = 1000,
     return encoders[model_name](max_length=max_length, active=active)
 
 
+def _get_model_path(model_name):
+    import os
+    """Get the correct path for a locally cached model."""
+    models_base = os.environ.get('MODELS_BASE_PATH', './models')
+    base_path = os.path.join(models_base, f"models--{model_name}")
+    snapshots_path = os.path.join(base_path, "snapshots")
+    
+    if os.path.exists(snapshots_path):
+        # Get the first (and typically only) snapshot directory
+        snapshots = os.listdir(snapshots_path)
+        if snapshots:
+            return os.path.join(snapshots_path, snapshots[0])
+    
+    return base_path
+
 def get_protein_tokenizer(model_name: str):
+    import os
     tokenizers = {
         "prot_t5": T5Tokenizer.from_pretrained(
-            "Rostlab/prot_t5_xl_uniref50", 
+            _get_model_path("Rostlab--prot_t5_xl_uniref50"), 
             do_lower_case=False, 
             legacy=True, 
             clean_up_tokenization_spaces=True
         ),
-        "esm2": AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D"),
-        "saprot": AutoTokenizer.from_pretrained("westlake-repl/SaProt_1.3B_AF2"),
+        "esm2": AutoTokenizer.from_pretrained(_get_model_path("facebook--esm2_t36_3B_UR50D")),
+        "saprot": AutoTokenizer.from_pretrained(_get_model_path("westlake-repl--SaProt_1.3B_AF2")),
     }
     return tokenizers[model_name]
 
