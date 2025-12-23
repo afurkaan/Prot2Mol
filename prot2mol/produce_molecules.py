@@ -12,7 +12,7 @@ import json
 import logging
 import argparse
 import warnings
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
 
 import torch
@@ -26,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from prot2mol.model import Prot2MolModel
 from prot2mol.protein_encoders import get_protein_tokenizer
-from prot2mol.utils import metrics_calculation
+from prot2mol.utils import metrics_calculation, canonicalize_smiles_list, decode_selfies_list
 import selfies as sf
 from rdkit import RDLogger
 
@@ -65,7 +65,8 @@ class MoleculeGenerator:
         # Initialize components
         self.mol_tokenizer = None
         self.prot_tokenizer = None
-        self.model = None
+        self.generation_model = None
+        self.prediction_model = None
         self.train_data = None
         self.train_vec = None
         
@@ -110,17 +111,38 @@ class MoleculeGenerator:
         self.logger.info("Loading protein tokenizer...")
         self.prot_tokenizer = get_protein_tokenizer(self.config.prot_emb_model)
         
-        # Load the unified model
-        self.logger.info(f"Loading model from {self.config.model_file}")
-        if not os.path.exists(self.config.model_file):
-            raise FileNotFoundError(f"Model file not found: {self.config.model_file}")
+        # Load the generation model
+        self.logger.info(f"Loading generation model from {self.config.model_file}")
+        self.generation_model = self._load_single_model(self.config.model_file)
+        self.generation_model.eval()
         
-        # Load model state dict and create model
-        with tqdm(desc="Loading model weights", unit="MB") as pbar:
-            model_state = torch.load(os.path.join(self.config.model_file, "pytorch_model.bin"), map_location=self.device)
+        # Load the prediction model
+        if self.config.prediction_model_file:
+            self.logger.info(f"Loading prediction model from {self.config.prediction_model_file}")
+            self.prediction_model = self._load_single_model(self.config.prediction_model_file)
+            self.prediction_model.eval()
+        else:
+            self.logger.info("No separate prediction model specified, using generation model for prediction")
+            self.prediction_model = self.generation_model
+
+        # Verify model is on correct device
+        model_device = next(self.generation_model.parameters()).device
+        self.logger.info(f"✅ Models loaded successfully on {model_device}")
+        
+        if torch.cuda.is_available() and model_device.type == 'cuda':
+            self.logger.info(f"💾 GPU Memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        
+    def _load_single_model(self, model_path: str):
+        """Helper to load a single Prot2Mol model instance."""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        # Load model state dict
+        with tqdm(desc=f"Loading model weights from {os.path.basename(model_path)}", unit="MB") as pbar:
+            model_state = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=self.device)
             pbar.update(1)
-        
-        # Create model config (this should match the training config)
+            
+        # Create model config
         model_config = {
             'prot_emb_model': self.config.prot_emb_model,
             'n_layer': getattr(self.config, 'n_layer', 1),
@@ -133,33 +155,53 @@ class MoleculeGenerator:
         }
         
         # Create and load model
-        self.model = Prot2MolModel(model_config)
-        self.model.load_state_dict(model_state, strict=False)
-        self.model.to(self.device)
-        self.model.eval()
+        model = Prot2MolModel(model_config)
+        model.load_state_dict(model_state, strict=False)
+        model.to(self.device)
+        return model
         
-        # Verify model is on correct device
-        model_device = next(self.model.parameters()).device
-        self.logger.info(f"✅ Model loaded successfully on {model_device}")
-        self.logger.info(f"📊 Total parameters: {self.model.num_parameters():,}")
-        
-        if torch.cuda.is_available() and model_device.type == 'cuda':
-            self.logger.info(f"💾 GPU Memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-        
-        # Set generation config
-        self.generation_config = GenerationConfig(
-            max_length=200,
-            do_sample=True,
-            pad_token_id=1,
-            bos_token_id=1,
-            eos_token_id=self.mol_tokenizer.eos_token_id,
-            temperature=1.0,
-            top_p=0.9
-        )
+        # Set geneartion config only if in generation mode
+        if self.config.mode == "generation":
+             self.generation_config = GenerationConfig(
+                max_length=200,
+                do_sample=True,
+                pad_token_id=1,
+                bos_token_id=1,
+                eos_token_id=self.mol_tokenizer.eos_token_id,
+                temperature=1.0,
+                top_p=0.9
+            )
     
+    def _load_prediction_data(self) -> pd.DataFrame:
+        """
+        Load data for prediction mode.
+        """
+        self.logger.info(f"Loading molecules for prediction from {self.config.input_molecules}")
+        
+        if not os.path.exists(self.config.input_molecules):
+             raise FileNotFoundError(f"Input molecules file not found: {self.config.input_molecules}")
+             
+        df = pd.read_csv(self.config.input_molecules)
+        
+        # Normalize column names lower case for check
+        cols = [c.lower() for c in df.columns]
+        
+        if 'smiles' not in cols and 'selfies' not in cols and 'compound_smiles' not in cols and 'compound_selfies' not in cols:
+             # Try to find a column that might contain molecules
+             potential_cols = [c for c in df.columns if 'smiles' in c.lower() or 'selfies' in c.lower()]
+             if not potential_cols:
+                  raise ValueError("Input file must contain a column with SMILES or SELFIES (e.g., 'smiles', 'Compound_SMILES', 'selfies', 'Compound_SELFIES')")
+        
+        self.logger.info(f"Loaded {len(df)} molecules for prediction")
+        
+        # Check if we need to load train data for metrics? No, prediction mode usually just predicts.
+        # But if we wanted to compute novelty etc we would need it. For now assuming just pchembl prediction.
+        
+        return df
+
     def _load_dataset(self) -> Tuple[pd.DataFrame, Optional[np.ndarray], pd.DataFrame]:
         """
-        Load and process the dataset.
+        Load and process the dataset for generation mode.
         
         Returns:
             Tuple of (train_data, train_vec, test_data)
@@ -309,7 +351,7 @@ class MoleculeGenerator:
                 
                 # Generate molecules
                 try:
-                    generated_tokens = self.model.generate(
+                    generated_tokens = self.generation_model.generate(
                         prot_input_ids=batch_prot_input_ids,
                         prot_attention_mask=batch_prot_attention_mask,
                         num_return_sequences=1,
@@ -338,6 +380,104 @@ class MoleculeGenerator:
         
         return generated_molecules
     
+    def _predict_pchembl_batch(self, prot_input_ids: torch.Tensor, prot_attention_mask: torch.Tensor, 
+                               mol_input_ids: torch.Tensor, mol_attention_mask: torch.Tensor) -> np.ndarray:
+        """
+        Predict pChEMBL values for a batch of molecules.
+        """
+        with torch.no_grad():
+            outputs = self.prediction_model(
+                mol_input_ids=mol_input_ids,
+                prot_input_ids=prot_input_ids,
+                prot_attention_mask=prot_attention_mask,
+                train_lm=False # No need to calculate LM loss during inference
+            )
+            predictions = outputs['pchembl_predictions'].cpu().numpy()
+            
+            # Denormalize
+            denormalized_preds = predictions * self.config.pchembl_std + self.config.pchembl_mean
+            return denormalized_preds
+
+    def predict_pchembl(self, protein_sequence: str, molecules_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Predict pChEMBL values for a dataframe of molecules against a target protein.
+        """
+        self.logger.info(f"Predicting pChEMBL for {len(molecules_df)} molecules...")
+        
+        # Identify molecule column
+        mol_col = None
+        is_selfies = False
+        
+        # Prioritize SELFIES
+        for col in molecules_df.columns:
+            if 'selfies' in col.lower():
+                mol_col = col
+                is_selfies = True
+                break
+        
+        if not mol_col:
+            for col in molecules_df.columns:
+                if 'smiles' in col.lower():
+                    mol_col = col
+                    break
+        
+        if not mol_col:
+            raise ValueError("Could not find SMILES or SELFIES column")
+            
+        # Get protein embeddings (prepare once)
+        prot_input_ids, prot_attention_mask = self._get_protein_embeddings(protein_sequence)
+        
+        # Batch processing
+        batch_size = self.config.batch_size
+        all_preds = []
+        
+        # Convert to SELFIES if strings are SMILES
+        molecules_list = molecules_df[mol_col].tolist()
+        selfies_list = []
+        
+        if not is_selfies:
+            self.logger.info("Converting SMILES to SELFIES for prediction...")
+            for smi in tqdm(molecules_list, desc="SMILES->SELFIES"):
+                try:
+                    s = sf.encoder(smi)
+                    selfies_list.append(s if s else "[nop]")
+                except:
+                    selfies_list.append("[nop]")
+        else:
+            selfies_list = molecules_list
+
+        # Run prediction in batches
+        num_batches = (len(selfies_list) + batch_size - 1) // batch_size
+        
+        for i in tqdm(range(num_batches), desc="Predicting pChEMBL"):
+            batch_selfies = selfies_list[i*batch_size : (i+1)*batch_size]
+            current_batch_len = len(batch_selfies)
+            
+            # Tokenize molecules
+            mol_tokens = self.mol_tokenizer.batch_encode_plus(
+                batch_selfies,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=self.config.max_mol_len,
+                padding='max_length',
+                return_tensors='pt'
+            )
+            
+            batch_mol_ids = mol_tokens['input_ids'].to(self.device)
+            batch_mol_mask = mol_tokens['attention_mask'].to(self.device)
+            
+            # Expand protein to batch size
+            batch_prot_ids = prot_input_ids.repeat(current_batch_len, 1)
+            batch_prot_mask = prot_attention_mask.repeat(current_batch_len, 1)
+            
+            # Predict
+            preds = self._predict_pchembl_batch(batch_prot_ids, batch_prot_mask, batch_mol_ids, batch_mol_mask)
+            all_preds.extend(preds)
+            
+        # Add predictions to dataframe
+        molecules_df['Predicted_pChEMBL'] = all_preds
+        return molecules_df
+
     def generate_molecules(self, protein_sequence: str, num_samples: int) -> pd.DataFrame:
         """
         Generate molecules for a given protein sequence.
@@ -359,6 +499,42 @@ class MoleculeGenerator:
             prot_input_ids, prot_attention_mask, num_samples
         )
         
+        # Calcuate pChEMBL for generated molecules
+        self.logger.info("Predicting pChEMBL for generated molecules...")
+        
+        # Reuse prediction batch logic but we already have SELFIES
+        # Prepare batches
+        batch_size = self.config.batch_size
+        all_preds = []
+        
+        num_batches = (len(generated_selfies) + batch_size - 1) // batch_size
+        
+        for i in tqdm(range(num_batches), desc="Predicting pChEMBL"):
+            batch_selfies = generated_selfies[i*batch_size : (i+1)*batch_size]
+            current_batch_len = len(batch_selfies)
+            
+            # Handle empty/invalid generation by replacing with padding token equivalent or simple "[nop]"
+            # But tokenizer will handle strings.
+            clean_batch = [s if s else "[nop]" for s in batch_selfies]
+            
+            mol_tokens = self.mol_tokenizer.batch_encode_plus(
+                clean_batch,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=self.config.max_mol_len,
+                padding='max_length',
+                return_tensors='pt'
+            )
+            
+            batch_mol_ids = mol_tokens['input_ids'].to(self.device)
+            batch_mol_mask = mol_tokens['attention_mask'].to(self.device)
+             # Expand protein to batch size
+            batch_prot_ids = prot_input_ids.repeat(current_batch_len, 1)
+            batch_prot_mask = prot_attention_mask.repeat(current_batch_len, 1)
+            
+            preds = self._predict_pchembl_batch(batch_prot_ids, batch_prot_mask, batch_mol_ids, batch_mol_mask)
+            all_preds.extend(preds)
+        
         # Extract model name from model file path
         model_name = os.path.basename(self.config.model_file.rstrip('/'))
         if not model_name:  # Handle case where path ends with '/'
@@ -369,6 +545,7 @@ class MoleculeGenerator:
         
         results_df = pd.DataFrame({
             'Generated_SELFIES': generated_selfies,
+            'Predicted_pChEMBL': all_preds,
             'Protein_ID': [self.config.prot_id] * len(generated_selfies),
             'Model_Name': [model_name] * len(generated_selfies),
             'Protein_Encoder': [self.config.prot_emb_model] * len(generated_selfies),
@@ -383,13 +560,13 @@ class MoleculeGenerator:
         
         return results_df
     
-    def calculate_metrics(self, generated_df: pd.DataFrame, reference_selfies: List[str]) -> Dict:
+    def calculate_metrics(self, generated_df: pd.DataFrame, reference_smiles: List[str]) -> Dict:
         """
         Calculate generation metrics.
         
         Args:
             generated_df: DataFrame with generated molecules
-            reference_selfies: Reference SELFIES for comparison
+            reference_smiles: Reference SMILES for comparison
             
         Returns:
             Dictionary with calculated metrics
@@ -399,7 +576,7 @@ class MoleculeGenerator:
         try:
             metrics, results_df = metrics_calculation(
                 predictions=generated_df['Generated_SELFIES'].tolist(),
-                references=reference_selfies,
+                references=reference_smiles,
                 train_data=self.train_data,
                 train_vec=self.train_vec,
                 training=False
@@ -508,64 +685,114 @@ class MoleculeGenerator:
         self.logger.info(f"📈 Metrics saved to {metrics_path}")
     
     def run_generation(self):
-        """Run the complete molecule generation pipeline."""
-        self.logger.info("Starting molecule generation pipeline...")
+        """Run the complete pipeline based on configuration mode."""
         
-        # Overall progress tracking
-        total_steps = 4  # dataset loading, generation, metrics/conversion, saving
-        with tqdm(total=total_steps, desc="🧬 Prot2Mol Pipeline", unit="step") as overall_pbar:
+        if self.config.mode == "prediction":
+             self.logger.info("Starting pChEMBL prediction pipeline...")
+             
+             # Step 1: Load molecules
+             molecules_df = self._load_prediction_data()
+             
+             # Get protein sequence - We need it!
+             # If prediction mode, we might not have 'test_{prot_id}.csv'.
+             # We rely on self._load_dataset logic OR we need the user to provide FASTA.
+             # Wait, the user provides prot_id. We usually get FASTA from the dataset files.
+             
+             # Let's try to load the FASTA from the dataset directory if available, 
+             # otherwise we might need a FASTA argument. 
+             # The current logic assumes dataset directory structure. 
+             # Let's re-use _load_dataset logic just to get the FASTA if possible.
+             
+             protein_sequence = None
+             try:
+                 _, _, test_data = self._load_dataset()
+                 if len(test_data) > 0:
+                     protein_sequence = test_data.iloc[0]['Target_FASTA']
+             except Exception as e:
+                 self.logger.warning(f"Could not load protein sequence from dataset files: {e}")
             
-            # Step 1: Load dataset
-            overall_pbar.set_description("📂 Loading dataset")
-            self.train_data, self.train_vec, test_data = self._load_dataset()
-            overall_pbar.update(1)
+             if not protein_sequence:
+                 # If we still don't have it, we are stuck unless we add a --protein_sequence arg.
+                 # or we assume input file has it.
+                 if 'Target_FASTA' in molecules_df.columns:
+                     protein_sequence = molecules_df.iloc[0]['Target_FASTA']
+                 else:
+                     raise ValueError("Could not find protein sequence! Ensure it is in the dataset or input file.")
+
+             # Step 2: Predict
+             results_df = self.predict_pchembl(protein_sequence, molecules_df)
+             
+             # Step 3: Save
+             self.save_results(results_df, {}, self.config.output_file)
+             
+             return results_df, {}
+
+        else:
+            # Generation Mode
+            self.logger.info("Starting molecule generation pipeline...")
             
-            # Get protein sequence
-            if len(test_data) == 0:
-                raise ValueError(f"No test data found for protein {self.config.prot_id}")
+            # Overall progress tracking
+            total_steps = 4  # dataset loading, generation, metrics/conversion, saving
+            with tqdm(total=total_steps, desc="🧬 Prot2Mol Pipeline", unit="step") as overall_pbar:
+                
+                # Step 1: Load dataset
+                overall_pbar.set_description("📂 Loading dataset")
+                self.train_data, self.train_vec, test_data = self._load_dataset()
+                overall_pbar.update(1)
+                
+                # Get protein sequence
+                if len(test_data) == 0:
+                    raise ValueError(f"No test data found for protein {self.config.prot_id}")
+                
+                # Use the first protein sequence (they should all be the same for the target protein)
+                protein_sequence = test_data.iloc[0]['Target_FASTA']
+                reference_smiles = []
+                if 'Compound_SMILES' in test_data.columns:
+                    reference_smiles = canonicalize_smiles_list(test_data['Compound_SMILES'].tolist(), drop_invalid=True)
+                elif 'Compound_SELFIES' in test_data.columns:
+                    decoded = decode_selfies_list(test_data['Compound_SELFIES'].tolist())
+                    reference_smiles = canonicalize_smiles_list(decoded, drop_invalid=True)
+                else:
+                    self.logger.warning("No Compound_SMILES or Compound_SELFIES column available for reference metrics")
+                
+                # Step 2: Generate molecules
+                overall_pbar.set_description("🔬 Generating molecules")
+                generated_df = self.generate_molecules(protein_sequence, self.config.num_samples)
+                overall_pbar.update(1)
+                
+                # Step 3: Calculate metrics or convert SELFIES
+                overall_pbar.set_description("📊 Processing results")
+                metrics = {}
+                if reference_smiles:
+                    metrics = self.calculate_metrics(generated_df, reference_smiles)
+                else:
+                    # If no reference data, still convert SELFIES to SMILES
+                    self.logger.info("No reference data available for metrics, but converting SELFIES to SMILES...")
+                    try:
+                        generated_smiles = []
+                        for selfies in tqdm(generated_df['Generated_SELFIES'], desc="Converting SELFIES→SMILES"):
+                            try:
+                                smiles = sf.decoder(selfies.replace(" ", ""))
+                                generated_smiles.append(smiles if smiles else "")
+                            except Exception as e:
+                                self.logger.warning(f"Failed to decode SELFIES: {selfies}, error: {e}")
+                                generated_smiles.append("")
+                        generated_df['Generated_SMILES'] = generated_smiles
+                        self.logger.info("SELFIES to SMILES conversion completed")
+                    except Exception as e:
+                        self.logger.error(f"Error converting SELFIES to SMILES: {e}")
+                overall_pbar.update(1)
+                
+                # Step 4: Save results
+                overall_pbar.set_description("💾 Saving results")
+                self.save_results(generated_df, metrics, self.config.output_file)
+                overall_pbar.update(1)
+                
+                overall_pbar.set_description("✅ Pipeline completed")
             
-            # Use the first protein sequence (they should all be the same for the target protein)
-            protein_sequence = test_data.iloc[0]['Target_FASTA']
-            reference_selfies = test_data['Compound_SELFIES'].tolist() if 'Compound_SELFIES' in test_data.columns else []
+            self.logger.info("Molecule generation pipeline completed successfully!")
             
-            # Step 2: Generate molecules
-            overall_pbar.set_description("🔬 Generating molecules")
-            generated_df = self.generate_molecules(protein_sequence, self.config.num_samples)
-            overall_pbar.update(1)
-            
-            # Step 3: Calculate metrics or convert SELFIES
-            overall_pbar.set_description("📊 Processing results")
-            metrics = {}
-            if reference_selfies:
-                metrics = self.calculate_metrics(generated_df, reference_selfies)
-            else:
-                # If no reference data, still convert SELFIES to SMILES
-                self.logger.info("No reference data available for metrics, but converting SELFIES to SMILES...")
-                try:
-                    generated_smiles = []
-                    for selfies in tqdm(generated_df['Generated_SELFIES'], desc="Converting SELFIES→SMILES"):
-                        try:
-                            smiles = sf.decoder(selfies.replace(" ", ""))
-                            generated_smiles.append(smiles if smiles else "")
-                        except Exception as e:
-                            self.logger.warning(f"Failed to decode SELFIES: {selfies}, error: {e}")
-                            generated_smiles.append("")
-                    generated_df['Generated_SMILES'] = generated_smiles
-                    self.logger.info("SELFIES to SMILES conversion completed")
-                except Exception as e:
-                    self.logger.error(f"Error converting SELFIES to SMILES: {e}")
-            overall_pbar.update(1)
-            
-            # Step 4: Save results
-            overall_pbar.set_description("💾 Saving results")
-            self.save_results(generated_df, metrics, self.config.output_file)
-            overall_pbar.update(1)
-            
-            overall_pbar.set_description("✅ Pipeline completed")
-        
-        self.logger.info("Molecule generation pipeline completed successfully!")
-        
-        return generated_df, metrics
+            return generated_df, metrics
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -579,7 +806,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--model_file",
         required=True,
-        help="Path to the trained model directory"
+        help="Path to the trained generation model directory"
+    )
+    parser.add_argument(
+        "--prediction_model_file",
+        default=None,
+        help="Path to the trained prediction model directory. If not specified, uses generation model."
     )
     parser.add_argument(
         "--prot_emb_model",
@@ -596,8 +828,34 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prot_id",
-        required=True,
-        help="Target protein CHEMBL ID"
+        required=False,
+        help="Target protein CHEMBL ID (required for generation, optional for prediction if provided in input file)"
+    )
+    
+    # Operation modes
+    parser.add_argument(
+        "--mode",
+        choices=["generation", "prediction"],
+        default="generation",
+        help="Operation mode: 'generation' to generate new molecules, 'prediction' to predict pChEMBL for existing molecules"
+    )
+    parser.add_argument(
+        "--input_molecules",
+        help="Path to CSV file containing molecules for prediction mode. Must contain 'smiles' or 'selfies' column."
+    )
+    
+    # Normalization parameters
+    parser.add_argument(
+        "--pchembl_mean",
+        type=float,
+        default=5.924,
+        help="Mean pChEMBL value for denormalization"
+    )
+    parser.add_argument(
+        "--pchembl_std",
+        type=float,
+        default=1.362,
+        help="Standard deviation of pChEMBL value for denormalization"
     )
     
     # Generation parameters

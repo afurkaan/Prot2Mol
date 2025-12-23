@@ -93,6 +93,47 @@ def canonic_smiles(smiles_or_mol):
         return None
     return Chem.MolToSmiles(mol)
 
+def decode_selfies_list(selfies_list):
+    """
+    Decode a collection of SELFIES strings into SMILES strings.
+    Invalid SELFIES are converted to None.
+    """
+    decoded = []
+    for selfies in selfies_list:
+        if not isinstance(selfies, str):
+            decoded.append(None)
+            continue
+        normalized = selfies.replace(" ", "")
+        try:
+            smiles = sf.decoder(normalized)
+            decoded.append(smiles if smiles else None)
+        except Exception:
+            decoded.append(None)
+    return decoded
+
+def canonicalize_smiles_list(smiles_list, drop_invalid=False):
+    """
+    Canonicalize an iterable of SMILES strings using RDKit.
+    
+    Args:
+        smiles_list: Iterable of SMILES strings (or values convertible to strings)
+        drop_invalid: When True, invalid entries are removed. Otherwise they are kept as empty strings.
+    """
+    canonical = []
+    for smiles in smiles_list:
+        if isinstance(smiles, str):
+            cleaned = smiles.strip()
+        else:
+            cleaned = None
+        canonical_smiles = canonic_smiles(cleaned) if cleaned else None
+        if canonical_smiles:
+            canonical.append(canonical_smiles)
+        elif not drop_invalid:
+            canonical.append("")
+    if drop_invalid:
+        canonical = [s for s in canonical if s]
+    return canonical
+
 
 def fraction_unique(gen, k=None, n_jobs=1, check_validity=True):
     """
@@ -193,10 +234,12 @@ def logp_calculation(mols):
 def metrics_calculation(predictions, references, train_data, train_vec=None,training=True):
     
     # `predictions` are decoded SELFIES from the model.
-    # `references` are now expected to be ground-truth SMILES.
-    predictions = [x.replace(" ", "") for x in predictions]
-
-    prediction_smiles = pd.DataFrame([sf.decoder(x) for x in predictions], columns=["smiles"])
+    predictions = [(x or "").replace(" ", "") for x in predictions]
+    decoded_predictions = decode_selfies_list(predictions)
+    prediction_smiles = pd.DataFrame(
+        canonicalize_smiles_list(decoded_predictions, drop_invalid=False),
+        columns=["smiles"]
+    )
     
     # Initialize all metrics to 0
     metrics = {"validity": 0,
@@ -225,26 +268,28 @@ def metrics_calculation(predictions, references, train_data, train_vec=None,trai
     
         # Handle both DataFrame and list inputs for train_data
         if isinstance(train_data, list):
-            # If train_data is already a list of SMILES
-            training_data_smiles = train_data
+            training_data_smiles = [s for s in train_data if s]
         elif hasattr(train_data, 'columns'):
-            # If train_data is a pandas DataFrame
             if "Compound_SMILES" in train_data.columns:
-                training_data_smiles = train_data["Compound_SMILES"].tolist()
+                training_data_smiles = canonicalize_smiles_list(train_data["Compound_SMILES"].tolist(), drop_invalid=True)
+            elif "Compound_SELFIES" in train_data.columns:
+                decoded = decode_selfies_list(train_data["Compound_SELFIES"].tolist())
+                training_data_smiles = canonicalize_smiles_list(decoded, drop_invalid=True)
             else:
-                training_data_smiles = [sf.decoder(x) for x in train_data["Compound_SELFIES"]]
+                training_data_smiles = []
         elif hasattr(train_data, 'column_names'):
-            # If train_data is a HuggingFace Dataset
             if "Compound_SMILES" in train_data.column_names:
-                training_data_smiles = train_data["Compound_SMILES"]
+                training_data_smiles = canonicalize_smiles_list(train_data["Compound_SMILES"], drop_invalid=True)
+            elif "Compound_SELFIES" in train_data.column_names:
+                decoded = decode_selfies_list(train_data["Compound_SELFIES"])
+                training_data_smiles = canonicalize_smiles_list(decoded, drop_invalid=True)
             else:
-                training_data_smiles = [sf.decoder(x) for x in train_data["Compound_SELFIES"]]
+                training_data_smiles = []
         else:
             logging.warning(f"Unexpected train_data type: {type(train_data)}, using empty list")
             training_data_smiles = []
         
-        # `references` is now a list of SMILES, so we use it directly.
-        reference_smiles = references
+        reference_smiles = canonicalize_smiles_list(references or [], drop_invalid=True)
         
         # Try uniqueness calculation
         try:
@@ -272,10 +317,16 @@ def metrics_calculation(predictions, references, train_data, train_vec=None,trai
         # Try similarity calculations
         try:
             prediction_vecs = generate_vecs(prediction_mols)
-            reference_vec = generate_vecs([Chem.MolFromSmiles(x) for x in reference_smiles if Chem.MolFromSmiles(x) is not None])
+            reference_mols = [Chem.MolFromSmiles(x) for x in reference_smiles]
+            reference_mols = [mol for mol in reference_mols if mol is not None]
             
-            predicted_vs_reference_sim_mean, predicted_vs_reference_sim_list, _ = average_agg_tanimoto(reference_vec,prediction_vecs, no_list=False)
-            metrics["similarity_to_reference_samples"] = predicted_vs_reference_sim_mean
+            if reference_mols:
+                reference_vec = generate_vecs(reference_mols)
+                predicted_vs_reference_sim_mean, predicted_vs_reference_sim_list, _ = average_agg_tanimoto(reference_vec,prediction_vecs, no_list=False)
+                metrics["similarity_to_reference_samples"] = predicted_vs_reference_sim_mean
+            else:
+                predicted_vs_reference_sim_list = []
+                metrics["similarity_to_reference_samples"] = 0
         except (ZeroDivisionError, ValueError, RuntimeError) as e:
             logging.warning(f"Zero division at similarity_to_reference_samples calculation: {e}")
             metrics["similarity_to_reference_samples"] = 0

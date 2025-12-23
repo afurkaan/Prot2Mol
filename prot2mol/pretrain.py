@@ -26,7 +26,7 @@ from transformers import (
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_processing import train_val_test
 from prot2mol.trainer import GPT2_w_crs_attn_Trainer
-from prot2mol.utils import metrics_calculation
+from prot2mol.utils import metrics_calculation, canonicalize_smiles_list, decode_selfies_list
 from prot2mol.protein_encoders import get_protein_tokenizer
 from prot2mol.model import create_prot2mol_model
 
@@ -93,6 +93,8 @@ class TrainingScript:
         self.selfies_path = selfies_path
         self.pretrain_save_to = pretrain_save_to
         self.run_name = run_name
+        self.train_smiles_list = []
+        self.eval_reference_smiles = []
         
         # Log checkpoint information if resuming
         if self.training_config['resume_from_checkpoint']:
@@ -154,6 +156,55 @@ class TrainingScript:
             self.logger.info(f"Loading existing training vectors from {train_vecs_path}")
             self.training_vec = np.load(train_vecs_path)
             self.logger.info(f"Loaded training vectors with shape: {self.training_vec.shape}")
+
+    def _extract_smiles_list(self, data_source, drop_invalid=False):
+        """Extract SMILES strings from various dataset formats without expensive canonicalization."""
+        smiles_values = []
+        needs_canonicalization = False
+        try:
+            if hasattr(data_source, "column_names"):
+                if "Compound_SMILES" in data_source.column_names:
+                    smiles_values = list(data_source["Compound_SMILES"])
+                elif "Compound_SELFIES" in data_source.column_names:
+                    smiles_values = decode_selfies_list(list(data_source["Compound_SELFIES"]))
+                    needs_canonicalization = True
+            elif hasattr(data_source, "columns"):
+                if "Compound_SMILES" in data_source.columns:
+                    smiles_values = data_source["Compound_SMILES"].tolist()
+                elif "Compound_SELFIES" in data_source.columns:
+                    smiles_values = decode_selfies_list(data_source["Compound_SELFIES"].tolist())
+                    needs_canonicalization = True
+            elif isinstance(data_source, list):
+                smiles_values = data_source
+            else:
+                self.logger.warning(f"Unsupported data source for SMILES extraction: {type(data_source)}")
+        except Exception as exc:
+            self.logger.warning(f"Failed to extract SMILES: {exc}")
+            smiles_values = []
+        
+        if not smiles_values:
+            return []
+        
+        cleaned_smiles = []
+        for entry in smiles_values:
+            if isinstance(entry, str):
+                stripped = entry.strip()
+                if stripped:
+                    cleaned_smiles.append(stripped)
+            elif isinstance(entry, bytes):
+                stripped = entry.decode("utf-8").strip()
+                if stripped:
+                    cleaned_smiles.append(stripped)
+        
+        if not cleaned_smiles:
+            return []
+        
+        if needs_canonicalization:
+            return canonicalize_smiles_list(cleaned_smiles, drop_invalid=drop_invalid)
+        
+        if drop_invalid:
+            return [s for s in cleaned_smiles if s]
+        return cleaned_smiles
     
     def _generate_training_vectors(self, data_dir: str, output_path: str):
         """
@@ -624,15 +675,11 @@ class TrainingScript:
                 clean_up_tokenization_spaces=True
             )
             
-            # Convert decoded labels (SELFIES) to SMILES for metrics calculation
-            import selfies as sf
-            reference_smiles = []
-            for selfies_str in decoded_labels:
-                try:
-                    smiles = sf.decoder(selfies_str.replace(" ", ""))
-                    reference_smiles.append(smiles if smiles else "")
-                except Exception:
-                    reference_smiles.append("")
+            # Prefer pre-cached SMILES from the dataset; fallback to decoding labels
+            reference_smiles = getattr(self, "eval_reference_smiles", None)
+            if not reference_smiles:
+                fallback_decoded = decode_selfies_list(decoded_labels)
+                reference_smiles = canonicalize_smiles_list(fallback_decoded, drop_invalid=True)
             lm_metrics = metrics_calculation(
                 predictions=decoded_preds, 
                 references=reference_smiles, 
@@ -772,17 +819,14 @@ class TrainingScript:
             
             self.logger.info(f"Dataset split: {len(self.train_data)} train, {len(self.test_data)} test samples")
             
-            # Cache training SMILES for metrics calculation
-            # Convert Dataset to DataFrame-like structure for metrics
-            self.logger.info("Caching training data for metrics calculation...")
-            if "Compound_SMILES" in self.train_data.column_names:
-                self.train_smiles_list = self.train_data["Compound_SMILES"]
-            elif "Compound_SELFIES" in self.train_data.column_names:
-                import selfies as sf
-                self.train_smiles_list = [sf.decoder(selfies) for selfies in self.train_data["Compound_SELFIES"]]
-            else:
-                self.logger.warning("No SMILES or SELFIES found in training data")
-                self.train_smiles_list = []
+            # Cache canonical SMILES for both training and evaluation references
+            self.logger.info("Caching canonical SMILES for metrics...")
+            self.train_smiles_list = self._extract_smiles_list(self.train_data, drop_invalid=True)
+            self.eval_reference_smiles = self._extract_smiles_list(self.test_data, drop_invalid=True)
+            if not self.train_smiles_list:
+                self.logger.warning("Training data does not contain valid SMILES entries")
+            if not self.eval_reference_smiles:
+                self.logger.warning("Evaluation data does not contain valid SMILES entries")
             
             self.logger.info(f"Dataset loaded with {len(self.train_data)} training examples")
             
@@ -1038,6 +1082,12 @@ def parse_arguments():
         help="Directory to save trained models"
     )
     output_group.add_argument(
+        "--run_name_suffix",
+        type=str,
+        default=None,
+        help="Optional override for the final component of the save directory name"
+    )
+    output_group.add_argument(
         "--log_level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="INFO",
@@ -1063,6 +1113,42 @@ def parse_arguments():
     )
 
     return parser.parse_args()
+
+def _resolve_run_suffix(config) -> str:
+    """Determine the suffix used for naming run directories.
+    
+    Preference order:
+        1. User provided --run_name_suffix CLI argument
+        2. PROT2MOL_RUN_ID environment variable override
+        3. Cluster/job identifiers (e.g., SLURM, PBS, LSF, TORCHELASTIC)
+        4. Current date (YYYYMMDD)
+    """
+    if getattr(config, "run_name_suffix", None):
+        return config.run_name_suffix
+    
+    manual_env_override = os.environ.get("PROT2MOL_RUN_ID")
+    if manual_env_override:
+        return manual_env_override
+    
+    job_id_candidates = [
+        os.environ.get("SLURM_JOB_ID"),
+        os.environ.get("PBS_JOBID"),
+        os.environ.get("LSB_JOBID"),
+        os.environ.get("JOB_ID"),
+        os.environ.get("TORCHELASTIC_RUN_ID"),
+    ]
+    
+    normalized_job_id = None
+    for candidate in job_id_candidates:
+        if candidate and candidate.lower() not in {"default", "none"}:
+            normalized_job_id = candidate
+            break
+    
+    date_component = datetime.datetime.now().strftime("%Y%m%d")
+    if normalized_job_id:
+        return f"{date_component}_{normalized_job_id}"
+    
+    return date_component
 
 def validate_and_process_paths(config):
     """Validate input paths and process dataset information.
@@ -1138,11 +1224,11 @@ def create_run_name(config, dataset_name):
     run_components.append(f"layers_{config.n_layer}")
     run_components.append(f"heads_{config.n_head}")
     
-    # Create timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Create suffix that is shared across distributed processes
+    run_suffix = _resolve_run_suffix(config)
     
     # Combine all components
-    run_name = "_".join(run_components + [timestamp])
+    run_name = "_".join(run_components + [run_suffix])
     
     return run_name
 
