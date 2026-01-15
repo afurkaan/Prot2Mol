@@ -1,5 +1,7 @@
 models/
-deneme*
 data/
 .DS_Store
 __pycache__*
+*.csv
+*.png
+deneme*

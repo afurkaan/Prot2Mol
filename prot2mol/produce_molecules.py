@@ -129,9 +129,21 @@ class MoleculeGenerator:
         model_device = next(self.generation_model.parameters()).device
         self.logger.info(f"✅ Models loaded successfully on {model_device}")
         
+
         if torch.cuda.is_available() and model_device.type == 'cuda':
             self.logger.info(f"💾 GPU Memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-        
+
+        # Set generation config only if in generation mode
+        if self.config.mode == "generation":
+             self.generation_config = GenerationConfig(
+                max_length=200,
+                do_sample=True,
+                pad_token_id=1,
+                bos_token_id=1,
+                eos_token_id=self.mol_tokenizer.eos_token_id,
+                temperature=1.0,
+                top_p=0.9
+            )        
     def _load_single_model(self, model_path: str):
         """Helper to load a single Prot2Mol model instance."""
         if not os.path.exists(model_path):
@@ -159,18 +171,6 @@ class MoleculeGenerator:
         model.load_state_dict(model_state, strict=False)
         model.to(self.device)
         return model
-        
-        # Set geneartion config only if in generation mode
-        if self.config.mode == "generation":
-             self.generation_config = GenerationConfig(
-                max_length=200,
-                do_sample=True,
-                pad_token_id=1,
-                bos_token_id=1,
-                eos_token_id=self.mol_tokenizer.eos_token_id,
-                temperature=1.0,
-                top_p=0.9
-            )
     
     def _load_prediction_data(self) -> pd.DataFrame:
         """
@@ -186,11 +186,11 @@ class MoleculeGenerator:
         # Normalize column names lower case for check
         cols = [c.lower() for c in df.columns]
         
-        if 'smiles' not in cols and 'selfies' not in cols and 'compound_smiles' not in cols and 'compound_selfies' not in cols:
+        if 'smiles' not in cols and 'selfies' not in cols and 'compound_smiles' not in cols and 'compound_selfies' not in cols and 'generated_selfies' not in cols and 'generated_smiles' not in cols:
              # Try to find a column that might contain molecules
              potential_cols = [c for c in df.columns if 'smiles' in c.lower() or 'selfies' in c.lower()]
              if not potential_cols:
-                  raise ValueError("Input file must contain a column with SMILES or SELFIES (e.g., 'smiles', 'Compound_SMILES', 'selfies', 'Compound_SELFIES')")
+                  raise ValueError("Input file must contain a column with SMILES or SELFIES (e.g., 'smiles', 'Compound_SMILES', 'selfies', 'Compound_SELFIES', 'Generated_SELFIES')")
         
         self.logger.info(f"Loaded {len(df)} molecules for prediction")
         
@@ -693,31 +693,39 @@ class MoleculeGenerator:
              # Step 1: Load molecules
              molecules_df = self._load_prediction_data()
              
-             # Get protein sequence - We need it!
-             # If prediction mode, we might not have 'test_{prot_id}.csv'.
-             # We rely on self._load_dataset logic OR we need the user to provide FASTA.
-             # Wait, the user provides prot_id. We usually get FASTA from the dataset files.
-             
-             # Let's try to load the FASTA from the dataset directory if available, 
-             # otherwise we might need a FASTA argument. 
-             # The current logic assumes dataset directory structure. 
-             # Let's re-use _load_dataset logic just to get the FASTA if possible.
+             # Determine Protein ID if not provided
+             if not self.config.prot_id:
+                 if 'Protein_ID' in molecules_df.columns:
+                     self.config.prot_id = molecules_df.iloc[0]['Protein_ID']
+                     self.logger.info(f"Inferred Protein ID from input file: {self.config.prot_id}")
+                 elif 'Target_CHEMBL_ID' in molecules_df.columns:
+                     self.config.prot_id = molecules_df.iloc[0]['Target_CHEMBL_ID']
+                     self.logger.info(f"Inferred Protein ID from input file: {self.config.prot_id}")
              
              protein_sequence = None
-             try:
-                 _, _, test_data = self._load_dataset()
-                 if len(test_data) > 0:
-                     protein_sequence = test_data.iloc[0]['Target_FASTA']
-             except Exception as e:
-                 self.logger.warning(f"Could not load protein sequence from dataset files: {e}")
+             
+             # Strategy 1: Look up FASTA from dataset files using prot_id
+             if self.config.prot_id:
+                 try:
+                     self.logger.info(f"Attempting to fetch sequence for {self.config.prot_id} from dataset...")
+                     # _load_dataset uses self.config.prot_id to filter
+                     _, _, test_data = self._load_dataset()
+                     if len(test_data) > 0:
+                         protein_sequence = test_data.iloc[0]['Target_FASTA']
+                         self.logger.info("✅ Successfully retrieved protein sequence from dataset")
+                 except Exception as e:
+                     self.logger.warning(f"Could not load protein sequence from dataset files: {e}")
             
+             # Strategy 2: Look for FASTA in the input dataframe
              if not protein_sequence:
-                 # If we still don't have it, we are stuck unless we add a --protein_sequence arg.
-                 # or we assume input file has it.
                  if 'Target_FASTA' in molecules_df.columns:
                      protein_sequence = molecules_df.iloc[0]['Target_FASTA']
+                     self.logger.info("✅ Non-standard: Found protein sequence in input file")
                  else:
-                     raise ValueError("Could not find protein sequence! Ensure it is in the dataset or input file.")
+                     raise ValueError(f"Could not find protein sequence! \n"
+                                      f"1. Ensure 'prot_id' is provided or in the input file ('Protein_ID').\n"
+                                      f"2. Ensure the dataset at '{self.config.selfies_path}' contains data for this protein.\n"
+                                      f"3. Or provide 'Target_FASTA' in the input file.")
 
              # Step 2: Predict
              results_df = self.predict_pchembl(protein_sequence, molecules_df)
@@ -880,7 +888,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--max_mol_len",
         type=int,
-        default=256,
+        default=200,
         help="Maximum molecule sequence length"
     )
     
@@ -911,7 +919,13 @@ def main():
     # Generate output file path if not provided
     if config.output_file is None:
         timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        config.output_file = f"./generated_molecules_{config.prot_id}_{timestamp}.csv"
+        
+        # Get directory name safely and truncate if too long
+        model_name = os.path.basename(os.path.normpath(config.model_file))
+        if len(model_name) > 60:
+            model_name = model_name[:30] + "..." + model_name[-27:]
+            
+        config.output_file = f"./generated_molecules_{model_name}_{config.prot_emb_model}_{config.prot_id}_{timestamp}.csv"
     
     try:
         # Initialize generator and run
